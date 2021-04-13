@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"math/bits"
 )
 
@@ -49,108 +48,89 @@ func padding(input []byte) []byte {
 	return append(input, tmp[0:8]...)
 }
 
-func decomposition(input []byte) []byte {
-	l := len(input)
-	blockSize := l / 64
-	output := make([]byte, 256*blockSize)
-
-	for b := 0; b < blockSize; b++ {
-		// original => 512 bits, 64 byte
-		// w => 2048 bits, 256 byte
-
-		// W1,W2,...,W16 = M[b]
-		copy(output[b*256:b*256+64], input[b*64:(b+1)*64])
-		for k := 16; k < 64; k++ {
-			i := b*256 + k*4
-
-			wim2 := binary.BigEndian.Uint32(output[i-4*2 : i-4*1])
-			wim7 := binary.BigEndian.Uint32(output[i-4*7 : i-4*6])
-			wim15 := binary.BigEndian.Uint32(output[i-4*15 : i-4*14])
-			wim16 := binary.BigEndian.Uint32(output[i-4*16 : i-4*15])
-
-			x1 := bits.RotateLeft32(wim2, -17) ^ bits.RotateLeft32(wim2, -19) ^ (wim2 >> 10)
-			x2 := wim7
-			x3 := bits.RotateLeft32(wim15, -7) ^ bits.RotateLeft32(wim15, -18) ^ (wim15 >> 3)
-			x4 := wim16
-			binary.BigEndian.PutUint32(output[i:i+4], x1+x2+x3+x4)
+func bytes2Uint32Array(input []byte) []uint32 {
+	size := len(input) / 4
+	output := make([]uint32, size)
+	for i := 0; i < size; i++ {
+		for k := 0; k < 4; k++ {
+			output[i] |= uint32(input[i*4+k]) << ((3 - k) * 8)
 		}
 	}
 	return output
 }
 
-func hash(input []byte) []byte {
-	l := len(input)
-	blockSize := l / 256
-
-	hash := make([]byte, 32)
-	for i := 0; i < 8; i++ {
-		binary.BigEndian.PutUint32(hash[i*4:(i+1)*4], InitHash[i])
+func uint32Array2Bytes(input []uint32) []byte {
+	size := len(input) * 4
+	output := make([]byte, size)
+	for i := 0; i < size; i++ {
+		output[i] = byte(input[i/4] >> (8 * (3 - i%4)))
 	}
+	return output
+}
+
+func hash(input []uint32) []uint32 {
+	l := len(input)
+	blockSize := l / 16
+
+	hash := make([]uint32, 8)
+	copy(hash, InitHash[:])
 
 	for b := 0; b < blockSize; b++ {
-		var a2h [8]uint32
-		for i := 0; i < 8; i++ {
-			a2h[i] = binary.BigEndian.Uint32(hash[i*4 : (i+1)*4])
+		// decomposition
+		// original block => 512 bits, 64 byte
+		// w => 2048 bits, 256 byte
+		w := make([]uint32, 64)
+		// W1,W2,...,W16 = M[b]
+		for i := 0; i < 64; i++ {
+			if i < 16 {
+				w[i] = input[b*16+i]
+			} else {
+				t1 := bits.RotateLeft32(w[i-2], -17) ^ bits.RotateLeft32(w[i-2], -19) ^ (w[i-2] >> 10)
+				t2 := w[i-7]
+				t3 := bits.RotateLeft32(w[i-15], -7) ^ bits.RotateLeft32(w[i-15], -18) ^ (w[i-15] >> 3)
+				t4 := w[i-16]
+				w[i] = t1 + t2 + t3 + t4
+			}
 		}
 
+		// hash
+		var a2h [8]uint32
+		copy(a2h[:], hash)
 		for i := 0; i < 64; i++ {
 			t11 := a2h[7]
 			t12 := bits.RotateLeft32(a2h[4], -6) ^ bits.RotateLeft32(a2h[4], -11) ^ bits.RotateLeft32(a2h[4], -25)
 			t13 := (a2h[4] & a2h[5]) ^ ((^a2h[4]) & a2h[6])
 			t14 := KArray[i]
-			t15 := binary.BigEndian.Uint32(input[b*256+i*4 : b*256+(i+1)*4])
+			t15 := w[i]
 			t21 := bits.RotateLeft32(a2h[0], -2) ^ bits.RotateLeft32(a2h[0], -13) ^ bits.RotateLeft32(a2h[0], -22)
 			t22 := (a2h[0] & a2h[1]) ^ (a2h[0] & a2h[2]) ^ (a2h[1] & a2h[2])
 			t1 := t11 + t12 + t13 + t14 + t15
 			t2 := t21 + t22
-
-			a2h[7] = a2h[6]      // h = g
-			a2h[6] = a2h[5]      // g = f
-			a2h[5] = a2h[4]      // f = e
-			a2h[4] = a2h[3] + t1 // e = d+T1
-			a2h[3] = a2h[2]      // d = c
-			a2h[2] = a2h[1]      // c = b
-			a2h[1] = a2h[0]      // b = a
-			a2h[0] = t1 + t2     // a = t1 + t2
+			a2h[7], a2h[6], a2h[5], a2h[4], a2h[3], a2h[2], a2h[1], a2h[0] =
+				a2h[6], a2h[5], a2h[4], a2h[3]+t1, a2h[2], a2h[1], a2h[0], t1+t2
 		}
-
-		// update hash array
 		for i := 0; i < 8; i++ {
-			oldH := binary.BigEndian.Uint32(hash[i*4 : (i+1)*4])
-			newH := oldH + a2h[i]
-			binary.BigEndian.PutUint32(hash[i*4:(i+1)*4], newH)
+			hash[i] += a2h[i]
 		}
 	}
 	return hash
 }
 
-func sha256(input []byte) ([]byte, error) {
-	result := make([]byte, len(input))
-	copy(result, input[:])
-	fmt.Printf("original => %s\n", getHex(result))
-	result = padding(result)
-	fmt.Printf("padding => %s\n", getHex(result))
-	result = decomposition(result)
-	fmt.Printf("decomposition => %s\n", getHex(result))
-	result = hash(result)
-	fmt.Printf("hash => %s\n", getHex(result))
-	return result, nil
+func sha256(input []byte) []byte {
+	r1 := padding(input)
+	r2 := bytes2Uint32Array(r1)
+	r3 := hash(r2)
+	return uint32Array2Bytes(r3)
 }
 
 func getHex(bytes []byte) string {
-	// hash := make([]byte, hex.EncodedLen(len(bytes)))
-	// hex.Encode(hash, bytes)
-	// return string(hash)
-	return fmt.Sprintf("%08b", bytes)
+	hash := make([]byte, hex.EncodedLen(len(bytes)))
+	hex.Encode(hash, bytes)
+	return string(hash)
 }
 
 func main() {
 	msg := "hello world"
-	hashBytes, err := sha256([]byte(msg))
-	if err != nil {
-		log.Fatal(err)
-	}
-	hash := make([]byte, hex.EncodedLen(len(hashBytes)))
-	hex.Encode(hash, hashBytes)
-	fmt.Printf("result: %s\n", hash)
+	res := sha256([]byte(msg))
+	fmt.Println(getHex(res)) // => b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
 }
