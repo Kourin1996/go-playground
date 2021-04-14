@@ -31,21 +31,21 @@ var KArray [64]uint32 = [64]uint32{
 
 func padding(input []byte) []byte {
 	l := uint64(len(input))
-	tmp := make([]byte, 64)
-	tmp[0] = 0x80
-
 	// 64 bytes block
 	// (original message) + (0x80) + (k bytes 0 padding) + (8bytes original length)
 	// k = 56 - 1 - l
-	if l%64 <= 55 {
-		input = append(input, tmp[0:56-l%64]...)
-	} else {
-		input = append(input, tmp[0:64+56-l%64]...)
+	newSize := l + 1 + 8 + (55 - l%64)
+	if l%64 >= 55 {
+		newSize += 64
 	}
 
+	output := make([]byte, newSize)
+	copy(output[:l], input)
+	output[l] = 0x80
 	// add original message size (bits)
-	binary.BigEndian.PutUint64(tmp[:], l<<3)
-	return append(input, tmp[0:8]...)
+	binary.BigEndian.PutUint64(output[newSize-8:newSize], l<<3)
+
+	return output
 }
 
 func bytes2Uint32Array(input []byte) []uint32 {
@@ -68,18 +68,21 @@ func uint32Array2Bytes(input []uint32) []byte {
 	return output
 }
 
-func hash(input []uint32) []uint32 {
+func hash(input []uint32) [8]uint32 {
 	l := len(input)
 	blockSize := l / 16
 
-	hash := make([]uint32, 8)
-	copy(hash, InitHash[:])
+	var hash [8]uint32
+	var a2h [8]uint32
+	var w [64]uint32
+
+	copy(hash[:], InitHash[:])
+	copy(a2h[:], hash[:])
 
 	for b := 0; b < blockSize; b++ {
 		// decomposition
 		// original block => 512 bits, 64 byte
 		// w => 2048 bits, 256 byte
-		w := make([]uint32, 64)
 		// W1,W2,...,W16 = M[b]
 		for i := 0; i < 64; i++ {
 			if i < 16 {
@@ -94,8 +97,6 @@ func hash(input []uint32) []uint32 {
 		}
 
 		// hash
-		var a2h [8]uint32
-		copy(a2h[:], hash)
 		for i := 0; i < 64; i++ {
 			t11 := a2h[7]
 			t12 := bits.RotateLeft32(a2h[4], -6) ^ bits.RotateLeft32(a2h[4], -11) ^ bits.RotateLeft32(a2h[4], -25)
@@ -111,6 +112,7 @@ func hash(input []uint32) []uint32 {
 		}
 		for i := 0; i < 8; i++ {
 			hash[i] += a2h[i]
+			a2h[i] = hash[i]
 		}
 	}
 	return hash
@@ -120,7 +122,7 @@ func sha256(input []byte) []byte {
 	r1 := padding(input)
 	r2 := bytes2Uint32Array(r1)
 	r3 := hash(r2)
-	return uint32Array2Bytes(r3)
+	return uint32Array2Bytes(r3[:])
 }
 
 func getHex(bytes []byte) string {
