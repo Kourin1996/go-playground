@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"math"
 )
 
@@ -49,6 +52,14 @@ func findB(b uint16) (index int) {
 	return
 }
 
+func getLaneSize(r uint16, c uint16) uint8 {
+	i := findB(r + c)
+	if i == -1 {
+		panic("b not found")
+	}
+	return W[i]
+}
+
 func mod(x int, m int) int {
 	if x < 0 {
 		return x + m
@@ -76,7 +87,7 @@ func rot(x uint64, n int8, s uint8) uint64 {
 	}
 }
 
-func round(b uint16, A *State, rc uint64) {
+func round(b uint16, A *State, rc uint64, w uint8) {
 	var C, D [5]Lane
 	var B [5][5]Lane
 
@@ -86,7 +97,7 @@ func round(b uint16, A *State, rc uint64) {
 	}
 	for x := 0; x < 5; x++ {
 		xm1, xm2 := mod(x-1, 5), mod(x+1, 5)
-		D[x] = Lane(uint64(C[xm1]) ^ rot(uint64(C[xm2]), -1, 5))
+		D[x] = Lane(uint64(C[xm1]) ^ rot(uint64(C[xm2]), -1, w))
 	}
 	for x := 0; x < 5; x++ {
 		for y := 0; y < 5; y++ {
@@ -98,7 +109,7 @@ func round(b uint16, A *State, rc uint64) {
 	for x := 0; x < 5; x++ {
 		for y := 0; y < 5; y++ {
 			bx, by := y, mod(2*x+3*y, 5)
-			B[bx][by] = Lane(rot(uint64(A[x][y]), int8(R[x][y]), 5))
+			B[bx][by] = Lane(rot(uint64(A[x][y]), int8(R[x][y]), w))
 		}
 	}
 
@@ -119,17 +130,131 @@ func keccakf(b uint16, A *State) {
 	if bi == -1 {
 		panic("b not found")
 	}
-	n := N[bi]
+	n, w := N[bi], W[bi]
 
 	for i := uint8(0); i < n; i++ {
 		rc := RC[i]
-		round(b, A, rc)
+		round(b, A, rc, w)
 	}
 }
 
-func keccak() {
+func keccak(r uint16, c uint16, input []byte, d uint8, outputLen uint64) []byte {
+	if ((r + c) != 1600) || ((r % 8) != 0) {
+		panic("rate and capacity are invalid")
+	}
+	rateInBytes := int(r / 8)
+	laneSize, state := getLaneSize(r, c), new(State)
 
+	fmt.Printf("r=%d, c=%d, d=%b, laneSize=%d\n", r, c, d, laneSize)
+
+	blockSize, inputLen := 0, len(input)
+	for inputLen > 0 {
+		blockSize = inputLen
+		if inputLen > rateInBytes {
+			blockSize = rateInBytes
+		}
+
+		my := int(blockSize / 5)
+		for y := 0; y < my; y++ {
+			mx := blockSize - 5*y
+			if mx < 0 {
+				mx = 0
+			}
+
+			for x := 0; x < mx; x++ {
+				state[mod(x, 5)][mod(y, 5)] ^= Lane(input[x+5*y])
+			}
+		}
+
+		inputLen -= blockSize
+		if blockSize == rateInBytes {
+			keccakf(r+c, state)
+			blockSize = 0
+		}
+	}
+
+	state[blockSize%5][blockSize/5] ^= Lane(d)
+
+	if (d&0x80) != 0 && blockSize == (rateInBytes-1) {
+		keccakf(r+c, state)
+	}
+
+	state[(rateInBytes-1)%5][mod((rateInBytes-1)/5, 5)] ^= 0x80
+	keccakf(r+c, state)
+
+	output := make([]byte, 0, outputLen)
+	for outputLen > 0 {
+		blockSize = int(outputLen)
+		if blockSize > rateInBytes {
+			blockSize = rateInBytes
+		}
+		fmt.Printf("outputLen=%d, rateInBytes=%d, blockSize=%d[bytes]\n", outputLen, rateInBytes, blockSize)
+
+		// my := int(int(r) / (int(laneSize) * 5))
+		// for y := 0; y < my; y++ {
+		// 	mx := int(r)/int(laneSize) - 5*y
+		// 	if mx < 0 {
+		// 		mx = 0
+		// 	}
+
+		// 	for x := 0; x < mx; x++ {
+		// 		s := state[mod(x, 5)][mod(y, 5)]
+		// 		bytes := make([]byte, 8)
+		// 		binary.LittleEndian.PutUint64(bytes, uint64(s))
+		// 		output = append(output, bytes...)
+		// 	}
+		// }
+
+		for x := 0; x < 5; x++ {
+			for y := 0; y < 5; y++ {
+				s := state[mod(x, 5)][mod(y, 5)]
+				bytes := make([]byte, 8)
+				binary.LittleEndian.PutUint64(bytes, uint64(s))
+				output = append(output, bytes...)
+			}
+		}
+
+		outputLen -= uint64(blockSize)
+		if outputLen > 0 {
+			keccakf(r+c, state)
+		}
+	}
+
+	return output
+}
+
+func SHAKE128(input []byte, outputLen uint64) []byte {
+	return keccak(1344, 256, input, 0x1f, outputLen)
+}
+
+func SHAKE256(input []byte, outputLen uint64) []byte {
+	return keccak(1088, 512, input, 0x1f, outputLen)
+}
+
+func SHA3_224(input []byte) []byte {
+	return keccak(1152, 448, input, 0x06, 224/8)
+}
+
+func SHA3_256(input []byte) []byte {
+	return keccak(1088, 512, input, 0x06, 256/8)
+}
+
+func SHA3_384(input []byte) []byte {
+	return keccak(832, 768, input, 0x06, 384/8)
+}
+
+func SHA3_512(input []byte) []byte {
+	return keccak(576, 1024, input, 0x06, 512/8)
+}
+
+func getHex(bytes []byte) string {
+	hash := make([]byte, hex.EncodedLen(len(bytes)))
+	hex.Encode(hash, bytes)
+	return string(hash)
 }
 
 func main() {
+	msg := "hello world"
+	res := SHA3_224([]byte(msg))
+	fmt.Println(getHex(res))
 }
