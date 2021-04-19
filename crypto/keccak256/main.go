@@ -1,5 +1,7 @@
 package main
 
+// WIP: This is not finished to implement
+
 import (
 	"encoding/binary"
 	"encoding/hex"
