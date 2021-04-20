@@ -9,9 +9,7 @@ import (
 	"math"
 )
 
-type Lane uint64
-
-type State [5][5]Lane
+type State []byte
 
 var L = [7]uint8{0, 1, 2, 3, 4, 5, 6}
 var N = [7]uint8{}
@@ -41,6 +39,13 @@ func init() {
 		W[i] = uint8(math.Pow(float64(2), float64(l)))
 		B[i] = uint16(25) * uint16(W[i])
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func findB(b uint16) (index int) {
@@ -80,54 +85,86 @@ func rot(x uint64, n int8, s uint8) uint64 {
 	if n == 0 {
 		return x
 	}
-	isLeft, an := n > 0, uint8(mod(abs(int(n)), int(s)))
+	isRight, an := n > 0, uint8(mod(abs(int(n)), int(s)))
 	mask := ^(uint64(math.Pow(2, float64(64-s))) - 1)
-	if isLeft {
-		return (mask & ((x & mask) << an)) | (mask & ((x & mask) >> (s - an)))
-	} else {
+	if isRight {
 		return (mask & ((x & mask) >> an)) | (mask & ((x & mask) << (s - an)))
+	} else {
+		return (mask & ((x & mask) << an)) | (mask & ((x & mask) >> (s - an)))
 	}
 }
 
-func round(b uint16, A *State, rc uint64, w uint8) {
-	var C, D [5]Lane
-	var B [5][5]Lane
+func getBeginLaneIndex(l uint8, x, y int) int {
+	return (x + 5*y) * int(l) / 8
+}
+
+func readLane(A []byte, l uint8, x, y int) uint64 {
+	begin := getBeginLaneIndex(l, x, y)
+	end := begin + int(l)/8
+	return binary.BigEndian.Uint64(A[begin:end])
+}
+
+func writeLane(A []byte, l uint8, x, y int, v uint64) {
+	offset := getBeginLaneIndex(l, x, y)
+	bytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(bytes, v)
+	copy(A[offset:offset+int(l)/8], bytes[0:int(l)/8])
+}
+
+func xorLane(A []byte, l uint8, x, y int, v uint64) {
+	offset := getBeginLaneIndex(l, x, y)
+	bytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(bytes, v)
+	for i := uint8(0); i < l/8; i++ {
+		A[offset+int(i)] ^= bytes[i]
+	}
+}
+
+func round(b uint16, A []byte, rc uint64, w uint8) {
+	var C [5]uint64
+	var D uint64
 
 	// θ step
 	for x := 0; x < 5; x++ {
-		C[x] = A[x][0] ^ A[x][1] ^ A[x][2] ^ A[x][3] ^ A[x][4]
+		C[x] = readLane(A, w, x, 0) ^ readLane(A, w, x, 1) ^ readLane(A, w, x, 2) ^ readLane(A, w, x, 3) ^ readLane(A, w, x, 4)
 	}
 	for x := 0; x < 5; x++ {
 		xm1, xm2 := mod(x-1, 5), mod(x+1, 5)
-		D[x] = Lane(uint64(C[xm1]) ^ rot(uint64(C[xm2]), -1, w))
-	}
-	for x := 0; x < 5; x++ {
+		D = C[xm1] ^ rot(C[xm2], 1, w)
 		for y := 0; y < 5; y++ {
-			A[x][y] ^= D[x]
+			xorLane(A, w, x, y, D)
 		}
 	}
-
 	// ρ and π steps
-	for x := 0; x < 5; x++ {
-		for y := 0; y < 5; y++ {
-			bx, by := y, mod(2*x+3*y, 5)
-			B[bx][by] = Lane(rot(uint64(A[x][y]), int8(R[x][y]), w))
+	{
+		x, y := 1, 0
+		current, temp := readLane(A, w, x, y), uint64(0)
+		for t := 0; t < 24; t++ {
+			r, Y := int8(((t+1)*(t+2)/2)%64), (2*x+3*y)%5
+			x, y = y, Y
+			temp = readLane(A, w, x, y)
+			writeLane(A, w, x, y, rot(current, r, w))
+			current = temp
 		}
 	}
 
 	// χ step
-	for x := 0; x < 5; x++ {
+	{
+		var temp [5]uint64
 		for y := 0; y < 5; y++ {
-			a, b, c := uint64(B[x][y]), uint64(B[mod(x+1, 5)][y]), uint64(B[mod(x+2, 5)][y])
-			A[x][y] = Lane(a ^ (^b & c))
+			for x := 0; x < 5; x++ {
+				temp[x] = readLane(A, w, x, y)
+			}
+			for x := 0; x < 5; x++ {
+				writeLane(A, w, x, y, temp[x]^((^temp[mod(x+1, 5)])&temp[mod(x+2, 5)]))
+			}
 		}
 	}
 
-	// ι step
-	A[0][0] = Lane(uint64(A[0][0]) ^ rc)
+	xorLane(A, w, 0, 0, rc)
 }
 
-func keccakf(b uint16, A *State) {
+func keccakf(b uint16, A []byte) {
 	bi := findB(b)
 	if bi == -1 {
 		panic("b not found")
@@ -140,85 +177,45 @@ func keccakf(b uint16, A *State) {
 	}
 }
 
-func keccak(r uint16, c uint16, input []byte, d uint8, outputLen uint64) []byte {
+func keccak(r uint16, c uint16, input []byte, d byte, outputLen uint64) []byte {
 	if ((r + c) != 1600) || ((r % 8) != 0) {
 		panic("rate and capacity are invalid")
 	}
-	rateInBytes := int(r / 8)
-	laneSize, state := getLaneSize(r, c), new(State)
+	rateInBytes, laneSize, b := int(r/8), getLaneSize(r, c), r+c
+	state := make([]byte, 5*5*int(laneSize)/8)
 
-	fmt.Printf("r=%d, c=%d, d=%b, laneSize=%d\n", r, c, d, laneSize)
+	fmt.Printf("r=%d, c=%d, d=%b, rateInBytes=%d, laneSize=%d, outputLen=%d, stateSize=%d\n", r, c, d, rateInBytes, laneSize, outputLen, len(state))
 
-	blockSize, inputLen := 0, len(input)
+	inputLen := len(input)
+	blockSize, offset := 0, 0
 	for inputLen > 0 {
-		blockSize = inputLen
-		if inputLen > rateInBytes {
-			blockSize = rateInBytes
-		}
-
-		my := int(blockSize / 5)
-		for y := 0; y < my; y++ {
-			mx := blockSize - 5*y
-			if mx < 0 {
-				mx = 0
-			}
-
-			for x := 0; x < mx; x++ {
-				state[mod(x, 5)][mod(y, 5)] ^= Lane(input[x+5*y])
-			}
-		}
+		blockSize = min(inputLen, rateInBytes)
+		copy(state[0:blockSize], input[offset:offset+blockSize])
 
 		inputLen -= blockSize
+		offset += blockSize
 		if blockSize == rateInBytes {
-			keccakf(r+c, state)
+			keccakf(b, state)
 			blockSize = 0
 		}
 	}
 
-	state[blockSize%5][blockSize/5] ^= Lane(d)
-
-	if (d&0x80) != 0 && blockSize == (rateInBytes-1) {
-		keccakf(r+c, state)
+	state[blockSize] ^= d
+	if ((d & 0x80) != 0) && (blockSize == (rateInBytes - 1)) {
+		keccakf(b, state)
 	}
-
-	state[(rateInBytes-1)%5][mod((rateInBytes-1)/5, 5)] ^= 0x80
+	state[rateInBytes-1] ^= 0x80
 	keccakf(r+c, state)
 
-	output := make([]byte, 0, outputLen)
+	output, offset := make([]byte, outputLen), 0
 	for outputLen > 0 {
-		blockSize = int(outputLen)
-		if blockSize > rateInBytes {
-			blockSize = rateInBytes
-		}
-		fmt.Printf("outputLen=%d, rateInBytes=%d, blockSize=%d[bytes]\n", outputLen, rateInBytes, blockSize)
-
-		// my := int(int(r) / (int(laneSize) * 5))
-		// for y := 0; y < my; y++ {
-		// 	mx := int(r)/int(laneSize) - 5*y
-		// 	if mx < 0 {
-		// 		mx = 0
-		// 	}
-
-		// 	for x := 0; x < mx; x++ {
-		// 		s := state[mod(x, 5)][mod(y, 5)]
-		// 		bytes := make([]byte, 8)
-		// 		binary.LittleEndian.PutUint64(bytes, uint64(s))
-		// 		output = append(output, bytes...)
-		// 	}
-		// }
-
-		for x := 0; x < 5; x++ {
-			for y := 0; y < 5; y++ {
-				s := state[mod(x, 5)][mod(y, 5)]
-				bytes := make([]byte, 8)
-				binary.LittleEndian.PutUint64(bytes, uint64(s))
-				output = append(output, bytes...)
-			}
-		}
-
+		blockSize := min(int(outputLen), rateInBytes)
+		copy(output[offset:blockSize], state[0:blockSize])
 		outputLen -= uint64(blockSize)
+		offset += blockSize
+
 		if outputLen > 0 {
-			keccakf(r+c, state)
+			keccakf(b, state)
 		}
 	}
 
@@ -257,6 +254,6 @@ func getHex(bytes []byte) string {
 
 func main() {
 	msg := "hello world"
-	res := SHA3_224([]byte(msg))
+	res := SHA3_256([]byte(msg))
 	fmt.Println(getHex(res))
 }
