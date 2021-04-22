@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	HashIDSalt   = "l7y4hac4JHaiBkrd52aDASvZSI42vh3J"
+	HashIDSalt   = ""
 	HashIDLength = 15
 )
 
